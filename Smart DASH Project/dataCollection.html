@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DASH Client Data Collection with Fixed Quality</title>
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+</head>
+<body>
+    <video id="videoPlayer" controls></video>
+    <button id="startButton">Start Streaming</button>
+    <button id="stopButton" disabled>Stop Streaming</button>
+    <select id="qualitySelect" disabled>
+        <option value="auto">Auto</option>
+    </select>
+    <div id="currentQuality"></div>
+    <div id="networkSpeed"></div>
+    <div id="averageBitrate"></div>
+
+    <script>
+        const DASH_MANIFEST_URL = "https://ftp.itec.aau.at/datasets/DASHDataset2014/BigBuckBunny/10sec/BigBuckBunny_10s_onDemand_2014_05_09.mpd";
+        const BUFFER_THRESHOLD = 2; // Setting the buffer underrun detection limit in seconds
+        
+        let player;
+        let csvData = [];
+        let intervalId;
+        let underrunCount = 0;
+        let underrunDuration = 0;
+        let totalBitrate = 0;
+        let bitrateCount = 0;
+
+        document.getElementById('startButton').addEventListener('click', startStreaming);
+        document.getElementById('stopButton').addEventListener('click', stopStreaming);
+        document.getElementById('qualitySelect').addEventListener('change', changeQuality);
+
+        function startStreaming() {
+            const video = document.getElementById('videoPlayer');
+            player = dashjs.MediaPlayer().create();
+            player.initialize(video, DASH_MANIFEST_URL, true);
+
+            // stopping automatic bitrate changes
+            player.updateSettings({
+                'streaming': {
+                    'abr': {
+                        'autoSwitchBitrate': {
+                            'video': false
+                        }
+                    }
+                }
+            });
+
+            player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+                const qualities = player.getBitrateInfoListFor('video');
+                const qualitySelect = document.getElementById('qualitySelect');
+                qualities.forEach((q, index) => {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.text = `${q.width}x${q.height} (${Math.round(q.bitrate / 1000)} kbps)`;
+                    qualitySelect.add(option);
+                });
+                qualitySelect.disabled = false;
+                
+                // Initializing quality to the lowest setting
+                player.setQualityFor('video', 0);
+                qualitySelect.value = 0;
+                updateQualityInfo(qualities[0]);
+            });
+
+            // Inserting column names into CSV data
+            csvData.push(['Timestamp', 'Buffer Duration', 'Current Quality', 'Underrun Count', 'Underrun Duration', 'Network Speed', 'Current Bitrate (Kbps)', 'Average Bitrate (Kbps)']);
+
+            intervalId = setInterval(collectData, 1000); 
+
+            document.getElementById('startButton').disabled = true;
+            document.getElementById('stopButton').disabled = false;
+        }
+
+        function collectData() {
+            const bufferLevel = player.getBufferLength();
+            const bitrate = player.getQualityFor('video');
+            const bitrateInfo = player.getBitrateInfoListFor('video')[bitrate];
+            const throughputHistory = player.getAverageThroughput('video');
+            const networkSpeed = throughputHistory / 1000; 
+            const networkSpeedFormatted = networkSpeed >= 1024 ? 
+                (networkSpeed / 1024).toFixed(2) + ' Mbps' : 
+                networkSpeed.toFixed(2) + ' Kbps';
+
+            if (bufferLevel < BUFFER_THRESHOLD) {
+                underrunCount++;
+                underrunDuration++;
+            }
+
+            const currentQualityStr = `${bitrateInfo.width}x${bitrateInfo.height} (${Math.round(bitrateInfo.bitrate / 1000)} kbps)`;
+            const currentBitrate = bitrateInfo.bitrate / 1000; 
+            totalBitrate += currentBitrate;
+            bitrateCount++;
+            const averageBitrate = totalBitrate / bitrateCount;
+            
+            const dataPoint = [
+                Date.now(),
+                bufferLevel.toFixed(2),
+                currentQualityStr,
+                underrunCount,
+                underrunDuration,
+                networkSpeedFormatted,
+                currentBitrate.toFixed(2),
+                averageBitrate.toFixed(2)
+            ];
+
+            csvData.push(dataPoint);
+            console.log('Data point recorded:', dataPoint);
+
+            // Updating the UI components
+            updateQualityInfo(bitrateInfo);
+            document.getElementById('networkSpeed').textContent = `Network Speed: ${networkSpeedFormatted}`;
+            document.getElementById('averageBitrate').textContent = `Average Bitrate: ${averageBitrate.toFixed(2)} Kbps`;
+        }
+
+        function stopStreaming() {
+            clearInterval(intervalId);
+            player.destroy();
+
+            // Creating and saving the  CSV file
+            const csv = csvData.map(row => row.join(',')).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            if (link.download !== undefined) {
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', 'streaming_data_fixed_quality.csv');
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+            document.getElementById('qualitySelect').disabled = true;
+        }
+
+        function changeQuality() {
+            const qualitySelect = document.getElementById('qualitySelect');
+            const selectedQuality = parseInt(qualitySelect.value);
+            player.setQualityFor('video', selectedQuality);
+            
+            const selectedBitrateInfo = player.getBitrateInfoListFor('video')[selectedQuality];
+            updateQualityInfo(selectedBitrateInfo);
+        }
+
+        function updateQualityInfo(bitrateInfo) {
+            const currentQualityStr = `${bitrateInfo.width}x${bitrateInfo.height} (${Math.round(bitrateInfo.bitrate / 1000)} kbps)`;
+            document.getElementById('currentQuality').textContent = `Current Quality: ${currentQualityStr}`;
+        }
+    </script>
+</body>
+</html>
