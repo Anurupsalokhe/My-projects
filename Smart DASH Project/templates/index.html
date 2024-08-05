@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DASH Client with Automatic Quality Selection</title>
+    <!-- Loading DASH.js library for streaming -->
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+</head>
+<body>
+    <!-- Video player element -->
+    <video id="videoPlayer" controls></video>
+    <!-- Buttons to control streaming -->
+    <button id="startButton">Start Streaming</button>
+    <button id="stopButton" disabled>Stop Streaming</button>
+    <!-- Div elements to display various metrics -->
+    <div id="currentQuality"></div>
+    <div id="predictedQuality"></div>
+    <div id="qualityProbabilities"></div>
+    <div id="networkSpeed"></div>
+    <div id="currentBitrate"></div>
+    <div id="averageBitrate"></div>
+
+    <script>
+        // Constants for DASH streaming and update intervals
+        const DASH_MANIFEST_URL = "https://ftp.itec.aau.at/datasets/DASHDataset2014/BigBuckBunny/10sec/BigBuckBunny_10s_onDemand_2014_05_09.mpd";
+        const BUFFER_THRESHOLD = 2;
+        const UPDATE_INTERVAL = 1000; // 1 second
+        const PREDICTION_INTERVAL = 5000; // 5 seconds
+        
+        // Variables to store player instance and streaming data
+        let player;
+        let csvData = [];
+        let updateIntervalId;
+        let predictionIntervalId;
+        let underrunCount = 0;
+        let underrunDuration = 0;
+        let totalBitrate = 0;
+        let bitrateCount = 0;
+        let currentQualityIndex = -1;
+        let lastPredictedQuality = '';
+
+        // Event listeners for start and stop buttons
+        document.getElementById('startButton').addEventListener('click', startStreaming);
+        document.getElementById('stopButton').addEventListener('click', stopStreaming);
+
+        // Function to send quality prediction request to the server
+        async function predictQuality(bufferDuration, underrunCount, underrunDuration, networkSpeed) {
+            const response = await fetch('/predict_quality', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    bufferDuration,
+                    underrunCount,
+                    underrunDuration,
+                    networkSpeed
+                }),
+            });
+            return await response.json();
+        }
+
+        // Function to update streaming metrics
+        function updateMetrics() {
+            const bufferLevel = player.getBufferLength();
+            const throughputHistory = player.getAverageThroughput('video');
+            const networkSpeed = throughputHistory / 1000; // Convert to Kbps
+            const networkSpeedFormatted = networkSpeed >= 1024 ? 
+                (networkSpeed / 1024).toFixed(2) + ' Mbps' : 
+                networkSpeed.toFixed(2) + ' Kbps';
+
+            if (bufferLevel < BUFFER_THRESHOLD) {
+                underrunCount++;
+                underrunDuration++;
+            }
+
+            const bitrate = player.getQualityFor('video');
+            const bitrateInfo = player.getBitrateInfoListFor('video')[bitrate];
+            const currentBitrate = bitrateInfo.bitrate / 1000; // Convert to Kbps
+            totalBitrate += currentBitrate;
+            bitrateCount++;
+            const averageBitrate = totalBitrate / bitrateCount;
+
+            // Updating the real-time metrics in the DOM
+            document.getElementById('networkSpeed').textContent = `Network Speed: ${networkSpeedFormatted}`;
+            document.getElementById('currentBitrate').textContent = `Current Bitrate: ${currentBitrate.toFixed(2)} Kbps`;
+            document.getElementById('averageBitrate').textContent = `Average Bitrate: ${averageBitrate.toFixed(2)} Kbps`;
+
+            // Updating the current quality if it has changed
+            if (bitrate !== currentQualityIndex) {
+                currentQualityIndex = bitrate;
+                const currentQualityStr = `${bitrateInfo.width}x${bitrateInfo.height} (${Math.round(bitrateInfo.bitrate / 1000)} kbps)`;
+                document.getElementById('currentQuality').textContent = `Current Quality: ${currentQualityStr}`;
+            }
+
+            // Recording data point for CSV
+            const dataPoint = [
+                Date.now(),
+                bufferLevel.toFixed(2),
+                `${bitrateInfo.width}x${bitrateInfo.height} (${Math.round(bitrateInfo.bitrate / 1000)} kbps)`,
+                underrunCount,
+                underrunDuration,
+                networkSpeedFormatted,
+                currentBitrate.toFixed(2),
+                averageBitrate.toFixed(2),
+                lastPredictedQuality
+            ];
+            csvData.push(dataPoint);
+            console.log('Data point recorded:', dataPoint);
+        }
+
+        // Functions to update quality prediction
+        async function updatePrediction() {
+            const bufferLevel = player.getBufferLength();
+            const throughputHistory = player.getAverageThroughput('video');
+            const networkSpeed = throughputHistory / 1000; // Convert to Kbps
+
+            const prediction = await predictQuality(bufferLevel, underrunCount, underrunDuration, networkSpeed);
+            const predictedQuality = prediction.predicted_quality;
+            const probabilities = prediction.probabilities;
+
+            // Updating the predicted quality and probabilities in the DOM
+            document.getElementById('predictedQuality').textContent = `Predicted Quality: ${predictedQuality}`;
+            lastPredictedQuality = predictedQuality;
+
+
+            for (const [quality, probability] of sortedProbabilities) {
+                probabilitiesHtml += `<p>${quality}: ${(probability * 100).toFixed(2)}%</p>`;
+            }
+            document.getElementById('qualityProbabilities').innerHTML = probabilitiesHtml;
+
+            /// Setting the quality to the predicted one if it has changed
+            const qualityToSet = player.getBitrateInfoListFor('video').findIndex(q => 
+                `${q.width}x${q.height} (${Math.round(q.bitrate / 1000)} kbps)` === predictedQuality
+            );
+            if (qualityToSet !== -1 && qualityToSet !== currentQualityIndex) {
+                console.log(`Changing quality to: ${predictedQuality}`);
+                player.setQualityFor('video', qualityToSet);
+            }
+        }
+
+        // Function to start streaming and initialize metrics updates
+        function startStreaming() {
+            const video = document.getElementById('videoPlayer');
+            player = dashjs.MediaPlayer().create();
+            player.initialize(video, DASH_MANIFEST_URL, true);
+
+            // Disabling default adaptive bitrate (abr) rules
+            player.updateSettings({
+                'streaming': {
+                    'abr': {
+                        'autoSwitchBitrate': false
+                    }
+                }
+            });
+
+            //Initializing CSV data with headers
+            csvData = [['Timestamp', 'Buffer Duration', 'Current Quality', 'Underrun Count', 'Underrun Duration', 'Network Speed', 'Current Bitrate (Kbps)', 'Average Bitrate (Kbps)', 'Predicted Quality']];
+
+            // Starting continuous updates for metrics and predictions
+            updateIntervalId = setInterval(updateMetrics, UPDATE_INTERVAL);
+            predictionIntervalId = setInterval(updatePrediction, PREDICTION_INTERVAL);
+
+            // Adding event listener to stop streaming when video ends
+            video.addEventListener('ended', stopStreaming);
+
+            // Enable/disable buttons
+            document.getElementById('startButton').disabled = true;
+            document.getElementById('stopButton').disabled = false;
+        }
+        // Function to stop streaming and save metrics data to CSV
+        function stopStreaming() {
+            clearInterval(updateIntervalId);
+            clearInterval(predictionIntervalId);
+            if (player) {
+                player.destroy();
+            }
+            // Convert CSV data to a blob and trigger download
+            const csv = csvData.map(row => row.join(',')).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            if (link.download !== undefined) {
+                const url = URL.createObjectURL(blob);
+                link.setAttribute('href', url);
+                link.setAttribute('download', 'streaming_data.csv');
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+            // Enable/disable buttons
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+        }
+    </script>
+</body>
+</html>
